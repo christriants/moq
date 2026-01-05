@@ -45,36 +45,23 @@ impl Av01 {
 		}
 	}
 
-	fn init(&mut self, seq_header: &SequenceHeaderObu) -> anyhow::Result<()> {
-		let config = hang::catalog::VideoConfig {
-			coded_width: Some(seq_header.max_frame_width as u32),
-			coded_height: Some(seq_header.max_frame_height as u32),
-			codec: hang::catalog::AV1 {
-				profile: seq_header.seq_profile,
-				level: seq_header.operating_points.first().map(|op| op.seq_level_idx).unwrap_or(0),
-				tier: if seq_header.operating_points.first().map(|op| op.seq_tier).unwrap_or(false) {
-					'H'
-				} else {
-					'M'
-				},
-				bitdepth: seq_header.color_config.bit_depth as u8,
-				mono_chrome: seq_header.color_config.mono_chrome,
-				chroma_subsampling_x: seq_header.color_config.subsampling_x,
-				chroma_subsampling_y: seq_header.color_config.subsampling_y,
-				chroma_sample_position: seq_header.color_config.chroma_sample_position,
-				color_primaries: seq_header.color_config.color_primaries,
-				transfer_characteristics: seq_header.color_config.transfer_characteristics,
-				matrix_coefficients: seq_header.color_config.matrix_coefficients,
-				full_range: false,
-			}
-			.into(),
-			description: None,
-			framerate: None,
-			bitrate: None,
-			display_ratio_width: None,
-			display_ratio_height: None,
-			optimize_for_latency: None,
-		};
+	fn setup_track(&mut self, seq_header: &SequenceHeaderObu) -> anyhow::Result<()> {
+		let config = create_av1_config(
+			seq_header.seq_profile,
+			seq_header.operating_points.first().map(|op| op.seq_level_idx).unwrap_or(0),
+			if seq_header.operating_points.first().map(|op| op.seq_tier).unwrap_or(false) { 'H' } else { 'M' },
+			seq_header.color_config.bit_depth as u8,
+			seq_header.color_config.mono_chrome,
+			seq_header.color_config.subsampling_x,
+			seq_header.color_config.subsampling_y,
+			seq_header.color_config.chroma_sample_position,
+			seq_header.color_config.color_primaries,
+			seq_header.color_config.transfer_characteristics,
+			seq_header.color_config.matrix_coefficients,
+			seq_header.color_config.full_color_range,
+			Some(seq_header.max_frame_width as u32),
+			Some(seq_header.max_frame_height as u32),
+		);
 
 		if let Some(old) = &self.config {
 			if old == &config {
@@ -119,7 +106,6 @@ impl Av01 {
 			&data[..std::cmp::min(16, data.len())]
 		);
 
-		// For AV1 av1C format, manually parse the config without using the broken OBU
 		if data.len() >= 4 && data[0] == 0x0a {
 			tracing::debug!("Parsing av1C box - extracting config directly");
 
@@ -136,32 +122,25 @@ impl Av01 {
 			};
 
 			// Create config directly from av1C header
-			let config = hang::catalog::VideoConfig {
-				coded_width: Some(1280), // TODO: get from encoder settings
-				coded_height: Some(720),
-				codec: hang::catalog::AV1 {
-					profile: seq_profile,
-					level: seq_level_idx,
-					tier: if tier == 1 { 'H' } else { 'M' },
-					bitdepth,
-					mono_chrome: ((data[2] >> 4) & 0x01) == 1,
-					chroma_subsampling_x: ((data[2] >> 3) & 0x01) == 1,
-					chroma_subsampling_y: ((data[2] >> 2) & 0x01) == 1,
-					chroma_sample_position: (data[2] & 0x03),
-					color_primaries: 1, // BT.709
-					transfer_characteristics: 1, // BT.709
-					matrix_coefficients: 1, // BT.709
-					full_range: false,
-				}.into(),
-				description: None,
-				framerate: None,
-				bitrate: None,
-				display_ratio_width: None,
-				display_ratio_height: None,
-				optimize_for_latency: None,
-			};
+			let config = create_av1_config(
+				seq_profile,
+				seq_level_idx,
+				if tier == 1 { 'H' } else { 'M' },
+				bitdepth,
+				((data[2] >> 4) & 0x01) == 1,
+				((data[2] >> 3) & 0x01) == 1,
+				((data[2] >> 2) & 0x01) == 1,
+				data[2] & 0x03,
+				1, // BT.709
+				1, // BT.709
+				1, // BT.709
+				false, // av1C doesn't provide this
+				None, // Let browser determine
+				None,
+			);
 
 			// Initialize track with this config
+			// @todo add dimensions to name
 			let track = moq::Track {
 				name: self.broadcast.track_name("video"),
 				priority: 2,
@@ -250,11 +229,11 @@ impl Av01 {
 				// Try to parse, but if it fails (broken OBS headers), just skip parsing
 				match SequenceHeaderObu::parse(header, &mut &obu_data[1..]) {
 					Ok(seq_header) => {
-						self.init(&seq_header)?;
+						self.setup_track(&seq_header)?;
 					}
 					Err(e) => {
 						tracing::warn!("Failed to parse sequence header OBU, skipping: {}", e);
-						// Don't return error - just skip this broken header
+
 					}
 				}
 
@@ -352,12 +331,11 @@ impl Drop for Av01 {
 /// Iterator over AV1 Open Bitstream Units (OBUs)
 struct ObuIterator<'a, T: Buf + AsRef<[u8]> + 'a> {
 	buf: &'a mut T,
-	start: Option<usize>,
 }
 
 impl<'a, T: Buf + AsRef<[u8]> + 'a> ObuIterator<'a, T> {
 	pub fn new(buf: &'a mut T) -> Self {
-		Self { buf, start: None }
+		Self { buf }
 	}
 
 	pub fn flush(self) -> anyhow::Result<Option<Bytes>> {
@@ -437,4 +415,46 @@ impl<'a, T: Buf + AsRef<[u8]> + 'a> Iterator for ObuIterator<'a, T> {
 		let obu = self.buf.copy_to_bytes(total_size);
 		Some(Ok(obu))
 	}
+}
+
+fn create_av1_config(
+    profile: u8,
+    level: u8,
+    tier: char,
+    bitdepth: u8,
+    mono_chrome: bool,
+    chroma_subsampling_x: bool,
+    chroma_subsampling_y: bool,
+    chroma_sample_position: u8,
+    color_primaries: u8,
+    transfer_characteristics: u8,
+    matrix_coefficients: u8,
+    full_range: bool,
+    coded_width: Option<u32>,
+    coded_height: Option<u32>,
+) -> hang::catalog::VideoConfig {
+    hang::catalog::VideoConfig {
+        coded_width,
+        coded_height,
+        codec: hang::catalog::AV1 {
+            profile,
+            level,
+            tier,
+            bitdepth,
+            mono_chrome,
+            chroma_subsampling_x,
+            chroma_subsampling_y,
+            chroma_sample_position,
+            color_primaries,
+            transfer_characteristics,
+            matrix_coefficients,
+            full_range,
+        }.into(),
+        description: None,
+        framerate: None,
+        bitrate: None,
+        display_ratio_width: None,
+        display_ratio_height: None,
+        optimize_for_latency: None,
+    }
 }
